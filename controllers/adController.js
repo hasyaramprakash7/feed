@@ -3,8 +3,6 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { enqueueHlsJob } = require('../services/hlsQueue');
-
 const {
   Ad,
   Story,
@@ -29,10 +27,7 @@ const {
   persistFile,
   publicUrl,
 } = require('../config/multerR2');
-const {
-  processVideoFromFile,
-  processVideoFromUrl,
-} = require('../services/hlsService');
+
 const {
   sendPushNotificationToOwner,
 } = require('../services/notificationService');
@@ -299,18 +294,40 @@ const ownsAd = (req, ad) => {
 
 const isAdminReq = (req) => isAdmin(req.vendor);
 
-/* ✅ BULLETPROOF FILE EXTRACTION */
+/* ✅ BULLETPROOF FILE EXTRACTION
+   Reads files from req.files regardless of shape (.fields() → object,
+   .any() → array) and regardless of which field name the frontend used. */
+/* ✅ BULLETPROOF FILE EXTRACTION
+   Reads files from req.files regardless of shape (.fields() → object,
+   .any() → array) and regardless of which field name the frontend used. */
 const extractUploadedFiles = (req) => {
   const out = { media: null, poster: null, small: null };
   if (!req.files) return out;
-  const files = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
-  
+
+  const mediaNames = ['media', 'file', 'image', 'video', 'upload', 'files'];
+  const posterNames = ['poster', 'thumbnail', 'posterFile', 'posterImage'];
+  const smallNames = [
+    'thumbSmall',
+    'thumbnailSmall',
+    'thumb_small',
+    'thumbnail_small',
+    'thumb',
+    'small',
+    'smallThumb',
+    'small_thumb',
+  ];
+
+  const files = Array.isArray(req.files)
+    ? req.files
+    : Object.values(req.files).flat();
+
   for (const f of files) {
     const name = f.fieldname || '';
-    if (!out.media && ['media', 'file', 'image', 'video'].includes(name)) out.media = f;
-    else if (!out.poster && ['poster', 'thumbnail'].includes(name)) out.poster = f;
-    else if (!out.small && ['thumbSmall', 'thumbnailSmall', 'thumb', 'small'].includes(name)) out.small = f;
+    if (!out.media && mediaNames.includes(name)) out.media = f;
+    else if (!out.poster && posterNames.includes(name)) out.poster = f;
+    else if (!out.small && smallNames.includes(name)) out.small = f;
   }
+
   return out;
 };
 // ═════════════════════════════════════════════════════════
@@ -945,12 +962,6 @@ const sendPushToOwnerRole = async (ownerId, ownerRole, payload) => {
 // ✅ Fix 1: generate a small thumbnail at upload time
 // ✅ Fix 5: don't set poster URL from video guess
 // ═════════════════════════════════════════════════════════
-// Add to imports at the top of adController.js:
-// const { enqueueHlsJob } = require('../services/hlsQueue');
-
-// ─────────────────────────────────────────────────────────
-// CREATE POST  (queue-based HLS — non-blocking)
-// ─────────────────────────────────────────────────────────
 exports.createAd = async (req, res) => {
   const TAG = '🟢[createAd]';
   const t0 = Date.now();
@@ -958,13 +969,12 @@ exports.createAd = async (req, res) => {
   try {
     console.log(`\n${TAG} 🚀 START`);
 
-    const {
-      media: mediaFile,
-      poster: posterFile,
-      small: smallFile,
-    } = extractUploadedFiles(req);
+    const { media: mediaFile, poster: posterFile, small: smallFile } =
+      extractUploadedFiles(req);
 
-    console.log(`${TAG} 📥 media=${mediaFile?.originalname || 'NONE'} poster=${posterFile?.originalname || 'NONE'} small=${smallFile?.originalname || 'NONE'}`);
+    console.log(
+      `${TAG} 📥 media=${mediaFile?.originalname || 'NONE'} poster=${posterFile?.originalname || 'NONE'} small=${smallFile?.originalname || 'NONE'}`
+    );
 
     if (!mediaFile) {
       return res.status(400).json({ success: false, message: 'Media file is required' });
@@ -984,6 +994,7 @@ exports.createAd = async (req, res) => {
       mediaType === 'video' ||
       (mediaFile.mimetype && mediaFile.mimetype.startsWith('video/'));
 
+    /* ── Upload media to R2 ── */
     let videoUrl = '';
     let imageUrl = '';
     let thumbnailSmallUrl = '';
@@ -1000,15 +1011,15 @@ exports.createAd = async (req, res) => {
     }
 
     if (posterFile) {
-      const persistedPoster = await persistFile(posterFile, 'bluxury/ads/posters');
-      if (persistedPoster?.path) imageUrl = persistedPoster.path;
+      const p = await persistFile(posterFile, 'bluxury/ads/posters');
+      if (p?.path) imageUrl = p.path;
     }
-
     if (smallFile) {
-      const persistedSmall = await persistFile(smallFile, 'bluxury/ads/thumbs');
-      if (persistedSmall?.path) thumbnailSmallUrl = persistedSmall.path;
+      const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
+      if (s?.path) thumbnailSmallUrl = s.path;
     }
 
+    /* ── Parse fields ── */
     const postType = actor.type === 'Vendor' ? 'vendor' : 'user';
     const kind = postKind || 'post';
 
@@ -1031,6 +1042,7 @@ exports.createAd = async (req, res) => {
     try { parsedCollaborators = collaborators ? (typeof collaborators === 'string' ? JSON.parse(collaborators) : collaborators) : []; } catch {}
     try { parsedTaggedUsers = taggedUsers ? (typeof taggedUsers === 'string' ? JSON.parse(taggedUsers) : taggedUsers) : []; } catch {}
 
+    /* ── Resolve owner ── */
     let vendorId = null, userId = null, vendorName = '', userName = '', userAvatar = '';
     if (actor.type === 'Vendor') {
       vendorId = actor.id;
@@ -1043,6 +1055,7 @@ exports.createAd = async (req, res) => {
       userAvatar = pickBestAvatar(u?.profilePic, u?.avatar);
     }
 
+    /* ── Build ad payload ── */
     const adPayload = {
       title: title || '',
       description: description || '',
@@ -1051,7 +1064,7 @@ exports.createAd = async (req, res) => {
       image: imageUrl,
       video: videoUrl,
       hlsUrl: '',
-      hlsStatus: isVideo ? 'processing' : 'none',
+      hlsStatus: 'none',                 // ✅ MP4 only
       thumbnail: imageUrl,
       thumbnailSmall: thumbnailSmallUrl,
       mediaType: isVideo ? 'video' : 'image',
@@ -1090,7 +1103,10 @@ exports.createAd = async (req, res) => {
         ...(kind === 'reel' && { reelsCount: 1 }),
       });
     } catch {}
-    if (allHashtags.length > 0) { try { await updateHashtags(allHashtags, 1); } catch {} }
+
+    if (allHashtags.length > 0) {
+      try { await updateHashtags(allHashtags, 1); } catch {}
+    }
     if (category) {
       try {
         await updateUserInterest(actor.id, actor.type, category, allHashtags, null, null, isVideo ? 'video' : 'image');
@@ -1100,26 +1116,13 @@ exports.createAd = async (req, res) => {
     const io = req.app.get('io');
     if (io) {
       try {
-        io.emit('newPost', { postId: ad._id, userId: actor.id, userType: actor.type, postKind: kind });
-      } catch {}
-    }
-
-    // ✅ QUEUE HLS JOB (non-blocking)
-    if (isVideo && videoUrl) {
-      try {
-        const job = await enqueueHlsJob({
-          kind: 'ad',
-          adId: String(ad._id),
-          sourceUrl: videoUrl,
-          folder: 'bluxury/ads/hls',
-          keepUserPoster: !!posterFile,
-          keepUserThumb: !!smallFile,
+        io.emit('newPost', {
+          postId: ad._id,
+          userId: actor.id,
+          userType: actor.type,
+          postKind: kind,
         });
-        console.log(`${TAG} 📥 HLS job queued: ${job.jobId}`);
-      } catch (e) {
-        console.error(`${TAG} ⚠️ HLS enqueue failed:`, e?.message);
-        // Non-fatal — post is saved, just no HLS
-      }
+      } catch {}
     }
 
     const populated = await Ad.findById(ad._id)
@@ -1135,6 +1138,7 @@ exports.createAd = async (req, res) => {
   }
 };
 
+
 // ═════════════════════════════════════════════════════════
 // CREATE STORY
 // ═════════════════════════════════════════════════════════
@@ -1149,9 +1153,7 @@ exports.createStory = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Auth required' });
     }
     if (!mediaFile) {
-      return res
-        .status(400)
-        .json({ success: false, message: 'Media is required' });
+      return res.status(400).json({ success: false, message: 'Media is required' });
     }
 
     const profile = await resolveIdentity(actor.id, actor.type);
@@ -1159,31 +1161,8 @@ exports.createStory = async (req, res) => {
       mediaType === 'video' ||
       (mediaFile.mimetype && mediaFile.mimetype.startsWith('video/'));
 
-    let media = '';
-    let hlsUrl = '';
-    let tmpDir = null;
-
-    if (isVideo) {
-      const ext = (mediaFile.originalname || 'video.mp4')
-        .split('.')
-        .pop()
-        .toLowerCase();
-      const tmp = await writeBufferToTemp(
-        mediaFile.buffer,
-        `story.${ext || 'mp4'}`
-      );
-      tmpDir = tmp.tmpDir;
-      const { hlsUrl: hls, videoUrl: mp4 } = await processVideoFromFile(
-        tmp.filePath,
-        'bluxury/stories'
-      );
-      media = mp4;
-      hlsUrl = hls;
-    } else {
-      const persisted = await persistFile(mediaFile, 'bluxury/stories');
-      media = persisted?.path || '';
-    }
-    if (tmpDir) await cleanupTemp(tmpDir);
+    const persisted = await persistFile(mediaFile, 'bluxury/stories');
+    const media = persisted?.path || '';
 
     const story = new Story({
       userId: actor.id,
@@ -1195,7 +1174,6 @@ exports.createStory = async (req, res) => {
       caption: caption || '',
       adId: adId && isValidId(adId) ? adId : null,
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      ...(hlsUrl && { hlsUrl }),
     });
     await story.save();
 
@@ -1624,54 +1602,52 @@ exports.getAdById = async (req, res) => {
   }
 };
 
-
-exports.getAdStatus = async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!isValidId(id)) {
-      return res.status(400).json({ success: false, message: 'Invalid post id' });
-    }
-    const ad = await Ad.findById(id)
-      .select('hlsStatus hlsUrl video image thumbnail thumbnailSmall mediaType')
-      .lean();
-    if (!ad) {
-      return res.status(404).json({ success: false, message: 'Post not found' });
-    }
-    res.status(200).json({ success: true, data: ad });
-  } catch (err) {
-    fail(res, err, 'Failed to load status');
-  }
-};
-
-
 exports.updateAd = async (req, res) => {
-  const TAG = '🟡[updateAd]';
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      return res.status(400).json({ success: false, message: 'Invalid post id' });
-    }
-
-    const ad = await Ad.findById(id);
-    if (!ad) {
-      return res.status(404).json({ success: false, message: 'Post not found' });
-    }
-    if (!ownsAd(req, ad) && !isAdminReq(req)) {
-      return res.status(403).json({ success: false, message: 'Not allowed' });
+      return res
+        .status(400)
+        .json({ success: false, message: 'Invalid post id' });
     }
 
     const {
-      title, description, category, link, isActive, isProductAd,
-      mediaType, postKind, tags, location, audio,
-      commentsDisabled, hideLikeCount,
+      title,
+      description,
+      category,
+      link,
+      isActive,
+      isProductAd,
+      mediaType,
+      postKind,
+      tags,
+      location,
+      audio,
+      commentsDisabled,
+      hideLikeCount,
     } = req.body;
 
+    const ad = await Ad.findById(id);
+    if (!ad) {
+      return res
+        .status(404)
+        .json({ success: false, message: 'Post not found' });
+    }
+    if (!ownsAd(req, ad) && !isAdminReq(req)) {
+      return res
+        .status(403)
+        .json({ success: false, message: 'Not allowed to edit this post' });
+    }
+
     const oldTags = [...(ad.tags || [])];
-    const { media: mediaFile, poster: posterFile, small: smallFile } =
-      extractUploadedFiles(req);
+    const {
+      media: mediaFile,
+      poster: posterFile,
+      small: smallFile,
+    } = extractUploadedFiles(req);
 
     /* ═══════════════════════════════════════════════════════════
-       CASE 1 — new video uploaded → queue HLS job
+       MEDIA CHANGES
        ═══════════════════════════════════════════════════════════ */
     if (mediaFile) {
       const isVideo =
@@ -1679,165 +1655,65 @@ exports.updateAd = async (req, res) => {
         (mediaFile.mimetype && mediaFile.mimetype.startsWith('video/'));
 
       if (isVideo) {
-        console.log(`${TAG} 📥 new video for ${id} — queuing HLS`);
-
-        // ── Delete old files (video, HLS, poster, thumbs) ──
+        /* ✅ Case 1: New VIDEO — direct MP4 upload (no ffmpeg) */
         if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
         if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
         if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
         if (ad.thumbnail)      await deleteFromR2(ad.thumbnail).catch(() => {});
         if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
 
-        // ── Upload NEW raw video ──
         const rawVideo = await persistFile(mediaFile, 'bluxury/ads/raw');
         if (!rawVideo?.path) {
-          return res.status(500).json({ success: false, message: 'Video upload failed' });
+          return res
+            .status(500)
+            .json({ success: false, message: 'Video upload failed' });
         }
         ad.video = rawVideo.path;
         ad.hlsUrl = '';
-        ad.hlsStatus = 'processing';
+        ad.hlsStatus = 'none';
         ad.mediaType = 'video';
-
-        // ── Upload NEW poster/thumb if provided ──
-        let keepUserPoster = false;
-        let keepUserThumb = false;
 
         if (posterFile) {
           const p = await persistFile(posterFile, 'bluxury/ads/posters');
           if (p?.path) {
             ad.image = p.path;
             ad.thumbnail = p.path;
-            keepUserPoster = true;
           }
         }
-        if (smallFile) {
-          const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
-          if (s?.path) {
-            ad.thumbnailSmall = s.path;
-            keepUserThumb = true;
-          }
-        }
+      } else {
+        /* ✅ Case 2: New IMAGE — replaces any existing video */
+        if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
+        if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
+        if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
+        if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
 
-        // ── Apply the rest of the field updates BEFORE saving ──
-        if (title !== undefined) ad.title = title;
-        if (description !== undefined) {
-          ad.description = description;
-          const hashtagsFromText = extractHashtags(description);
-          const currentTags = new Set(ad.tags || []);
-          hashtagsFromText.forEach((t) => currentTags.add(t));
-          ad.tags = Array.from(currentTags);
-        }
-        if (category !== undefined) ad.category = category;
-        if (link !== undefined) ad.link = link;
-        if (isActive !== undefined) ad.isActive = isActive === 'true';
-        if (isProductAd !== undefined) ad.isProductAd = isProductAd === 'true';
-        if (commentsDisabled !== undefined) ad.commentsDisabled = commentsDisabled === 'true';
-        if (hideLikeCount !== undefined) ad.hideLikeCount = hideLikeCount === 'true';
-        if (tags !== undefined) {
-          try {
-            const nt = Array.isArray(tags) ? tags : JSON.parse(tags);
-            ad.tags = nt.map((t) => String(t).toLowerCase());
-          } catch { ad.tags = []; }
-        }
-        if (location !== undefined) {
-          ad.location = typeof location === 'string' ? JSON.parse(location) : location;
-        }
-        if (audio !== undefined) {
-          ad.audio = typeof audio === 'string' ? JSON.parse(audio) : audio;
-        }
-        if (postKind !== undefined) {
-          ad.postKind = postKind;
-          ad.isReel = postKind === 'reel';
-          ad.isStory = postKind === 'story';
-        }
-
-        // ── Save first so worker can findByIdAndUpdate safely ──
-        await ad.save();
-        console.log(`${TAG} ✅ saved with hlsStatus=processing`);
-
-        // ── Queue the HLS job ──
-        try {
-          const job = await enqueueHlsJob({
-            kind: 'ad',
-            adId: String(ad._id),
-            sourceUrl: ad.video,
-            folder: 'bluxury/ads/hls',
-            keepUserPoster,
-            keepUserThumb,
-          });
-          console.log(`${TAG} 📥 HLS job queued: ${job.jobId}`);
-        } catch (e) {
-          console.error(`${TAG} ⚠️ HLS enqueue failed:`, e?.message);
-          ad.hlsStatus = 'failed';
-          await ad.save().catch(() => {});
-        }
-
-        // ── Update hashtags diff ──
-        const removedTags = oldTags.filter((t) => !(ad.tags || []).includes(t));
-        const addedTags = (ad.tags || []).filter((t) => !oldTags.includes(t));
-        if (removedTags.length > 0) await updateHashtags(removedTags, -1);
-        if (addedTags.length > 0)   await updateHashtags(addedTags, 1);
-
-        const populated = await Ad.findById(ad._id)
-          .populate('vendorId', VENDOR_POPULATE_FIELDS)
-          .populate('userId', USER_POPULATE_FIELDS)
-          .lean();
-
-        return res.status(200).json({ success: true, data: populated });
+        const persisted = await persistFile(mediaFile, 'bluxury/ads');
+        ad.image = persisted?.path || '';
+        ad.thumbnail = ad.image;
+        ad.video = '';
+        ad.hlsUrl = '';
+        ad.hlsStatus = 'none';
+        ad.mediaType = 'image';
       }
-
-      /* ═══════════════════════════════════════════════════════════
-         CASE 2 — new IMAGE uploaded (replaces any existing video)
-         ═══════════════════════════════════════════════════════════ */
-      console.log(`${TAG} 🖼️ new image for ${id} — replacing media`);
-
-      if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
-      if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
-      if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
-      if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
-
-      const persisted = await persistFile(mediaFile, 'bluxury/ads');
-      ad.image = persisted?.path || '';
-      ad.thumbnail = ad.image;
-      ad.video = '';
-      ad.hlsUrl = '';
-      ad.hlsStatus = 'none';
-      ad.mediaType = 'image';
-
-      if (smallFile) {
-        const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
-        if (s?.path) ad.thumbnailSmall = s.path;
-      }
-    }
-
-    /* ═══════════════════════════════════════════════════════════
-       CASE 3 — no new media, but poster replaced on existing video
-       ═══════════════════════════════════════════════════════════ */
-    else if (posterFile && ad.mediaType === 'video') {
+    } else if (posterFile && ad.mediaType === 'video') {
+      /* ✅ Case 3: Poster-only replace (video stays the same) */
       if (ad.image) await deleteFromR2(ad.image).catch(() => {});
       const p = await persistFile(posterFile, 'bluxury/ads/posters');
       if (p?.path) {
         ad.image = p.path;
         ad.thumbnail = p.path;
       }
-      if (smallFile) {
-        if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
-        const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
-        if (s?.path) ad.thumbnailSmall = s.path;
-      }
     }
 
-    /* ═══════════════════════════════════════════════════════════
-       CASE 4 — no new media, small thumb only
-       ═══════════════════════════════════════════════════════════ */
-    else if (smallFile) {
+    /* ✅ Small thumb (map/grid) — can update independently of media */
+    if (smallFile) {
       if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
-      const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
-      if (s?.path) ad.thumbnailSmall = s.path;
+      const persistedSmall = await persistFile(smallFile, 'bluxury/ads/thumbs');
+      if (persistedSmall?.path) ad.thumbnailSmall = persistedSmall.path;
     }
 
     /* ═══════════════════════════════════════════════════════════
-       Apply non-media field updates (all cases without new video)
+       TEXT / METADATA FIELDS
        ═══════════════════════════════════════════════════════════ */
     if (title !== undefined) ad.title = title;
     if (description !== undefined) {
@@ -1851,16 +1727,24 @@ exports.updateAd = async (req, res) => {
     if (link !== undefined) ad.link = link;
     if (isActive !== undefined) ad.isActive = isActive === 'true';
     if (isProductAd !== undefined) ad.isProductAd = isProductAd === 'true';
-    if (commentsDisabled !== undefined) ad.commentsDisabled = commentsDisabled === 'true';
-    if (hideLikeCount !== undefined) ad.hideLikeCount = hideLikeCount === 'true';
+    if (commentsDisabled !== undefined)
+      ad.commentsDisabled = commentsDisabled === 'true';
+    if (hideLikeCount !== undefined)
+      ad.hideLikeCount = hideLikeCount === 'true';
+
     if (tags !== undefined) {
+      let newTags = [];
       try {
-        const nt = Array.isArray(tags) ? tags : JSON.parse(tags);
-        ad.tags = nt.map((t) => String(t).toLowerCase());
-      } catch { ad.tags = []; }
+        newTags = Array.isArray(tags) ? tags : JSON.parse(tags);
+      } catch {
+        newTags = [];
+      }
+      ad.tags = newTags.map((t) => String(t).toLowerCase());
     }
+
     if (location !== undefined) {
-      ad.location = typeof location === 'string' ? JSON.parse(location) : location;
+      ad.location =
+        typeof location === 'string' ? JSON.parse(location) : location;
     }
     if (audio !== undefined) {
       ad.audio = typeof audio === 'string' ? JSON.parse(audio) : audio;
@@ -1873,11 +1757,17 @@ exports.updateAd = async (req, res) => {
 
     await ad.save();
 
+    /* ═══════════════════════════════════════════════════════════
+       HASHTAG COUNTERS
+       ═══════════════════════════════════════════════════════════ */
     const removedTags = oldTags.filter((t) => !(ad.tags || []).includes(t));
     const addedTags = (ad.tags || []).filter((t) => !oldTags.includes(t));
     if (removedTags.length > 0) await updateHashtags(removedTags, -1);
-    if (addedTags.length > 0)   await updateHashtags(addedTags, 1);
+    if (addedTags.length > 0) await updateHashtags(addedTags, 1);
 
+    /* ═══════════════════════════════════════════════════════════
+       RESPONSE
+       ═══════════════════════════════════════════════════════════ */
     const populated = await Ad.findById(ad._id)
       .populate('vendorId', VENDOR_POPULATE_FIELDS)
       .populate('userId', USER_POPULATE_FIELDS)
@@ -1885,7 +1775,6 @@ exports.updateAd = async (req, res) => {
 
     res.status(200).json({ success: true, data: populated });
   } catch (err) {
-    console.error(`${TAG} ❌ FAILED:`, err?.message);
     fail(res, err, 'Failed to update post');
   }
 };
