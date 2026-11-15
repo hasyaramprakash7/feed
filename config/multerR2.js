@@ -1,7 +1,4 @@
 // config/multerR2.js
-// Multer → memory storage → R2. Preserves the SAME export names as
-// config/multerCloudinary.js so routes/ad.js keeps working unchanged.
-
 const multer = require('multer');
 const {
   uploadBuffer,
@@ -14,17 +11,6 @@ const {
 
 const memoryStorage = multer.memoryStorage();
 
-const buildFileObject = (fieldname, originalname, mimetype, size, buffer) => {
-  return {
-    fieldname,
-    originalname,
-    mimetype,
-    size,
-    buffer,
-  };
-};
-
-// Generic single-file upload (kept for API compat)
 const upload = multer({
   storage: memoryStorage,
   limits: { fileSize: 100 * 1024 * 1024 },
@@ -43,7 +29,11 @@ const uploadAd = multer({
 }).fields([
   { name: 'media', maxCount: 1 },
   { name: 'poster', maxCount: 1 },
+  { name: 'thumbSmall', maxCount: 1 }, // 👈 THIS IS REQUIRED
 ]);
+
+// ✅ PROOF THAT THE SERVER IS USING THIS FILE
+console.log('✅ [multerR2] uploadAd successfully configured with fields: media, poster, thumbSmall');
 
 const uploadStory = multer({
   storage: memoryStorage,
@@ -55,25 +45,13 @@ const uploadMessage = multer({
   limits: { fileSize: 100 * 1024 * 1024 },
 }).fields([{ name: 'media', maxCount: 1 }]);
 
-// Upload a single buffer to R2 (used by controllers after compression/transcode)
 const persistFile = async (file, folder) => {
   if (!file || !file.buffer) return null;
-  const key = `${folder}/${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2, 10)}-${file.originalname || 'file'}`;
+  const key = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${file.originalname || 'file'}`;
   const url = await uploadBuffer(key, file.buffer, file.mimetype);
-  return {
-    path: url,
-    secure_url: url,
-    url,
-    key,
-    mimetype: file.mimetype,
-    size: file.size,
-    originalname: file.originalname,
-  };
+  return { path: url, secure_url: url, url, key, mimetype: file.mimetype, size: file.size, originalname: file.originalname };
 };
 
-// Mirror old deleteFromCloudinary signature: accepts URL or key
 const deleteFromR2 = async (urlOrKey) => {
   if (!urlOrKey || typeof urlOrKey !== 'string') return;
   const key = urlOrKey.startsWith('http') ? keyFromUrl(urlOrKey) : urlOrKey;
@@ -81,14 +59,8 @@ const deleteFromR2 = async (urlOrKey) => {
   await deleteObject(key);
 };
 
-// Backward-compatible alias — controllers still import `deleteFromCloudinary`
 const deleteFromCloudinary = deleteFromR2;
-
-// Deprecated alias — kept so old imports don't break
-const cloudinary = {
-  __isR2: true,
-  note: 'Cloudinary removed — using Cloudflare R2 + Bunny CDN',
-};
+const cloudinary = { __isR2: true, note: 'Cloudinary removed — using Cloudflare R2 + Bunny CDN' };
 
 const uploadMultipleToCloudinary = async (files) => {
   if (!files) return [];
@@ -101,15 +73,5 @@ const uploadMultipleToCloudinary = async (files) => {
 };
 
 module.exports = {
-  upload,
-  uploadAd,
-  uploadStory,
-  uploadMessage,
-  persistFile,
-  deleteFromR2,
-  deleteFromCloudinary,
-  uploadMultipleToCloudinary,
-  cloudinary,
-  publicUrl,
-  R2_PUBLIC_BASE_URL,
+  upload, uploadAd, uploadStory, uploadMessage, persistFile, deleteFromR2, deleteFromCloudinary, uploadMultipleToCloudinary, cloudinary, publicUrl, R2_PUBLIC_BASE_URL,
 };
