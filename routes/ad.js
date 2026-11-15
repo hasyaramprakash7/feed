@@ -118,7 +118,7 @@ router.put('/saved/collections/:id', authMiddleware, guardId, adController.updat
 router.delete('/saved/collections/:id', authMiddleware, guardId, adController.deleteSavedCollection);
 
 // ✅ CRUD (using the bulletproof upload)
-router.get('/:id/status', optionalAuth, guardId, adController.getAdStatus); // 👈 NEW
+
 router.get('/:id', optionalAuth, guardId, adController.getAdById);
 router.post('/', authMiddleware, wrapMulter(uploadAd, 'ad'), adController.createAd);
 router.put('/:id', authMiddleware, wrapMulter(uploadAd, 'ad-update'), guardId, adController.updateAd);
