@@ -139,6 +139,8 @@ const leadRoutes = require('./routes/lead');
 const adRoutes = require('./routes/ad');
 const uploadRoutes = require('./routes/uploadRoutes');
 app.use('/api/upload', uploadRoutes);
+const uploadPresignRoutes = require('./routes/uploadPresign');
+app.use('/api/upload', uploadPresignRoutes);
 
 console.log('📦 Registering rental routes at /api/v1/rentals');
 app.use('/api/v1/rentals', rentalRoutes);

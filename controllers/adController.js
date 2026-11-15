@@ -972,11 +972,17 @@ exports.createAd = async (req, res) => {
     const { media: mediaFile, poster: posterFile, small: smallFile } =
       extractUploadedFiles(req);
 
-    console.log(
-      `${TAG} 📥 media=${mediaFile?.originalname || 'NONE'} poster=${posterFile?.originalname || 'NONE'} small=${smallFile?.originalname || 'NONE'}`
-    );
+    // ✅ Support both direct R2 upload (presigned URL) AND legacy multer upload
+    const directVideoUrl =
+      typeof req.body.videoUrl === 'string' && /^https?:\/\//i.test(req.body.videoUrl)
+        ? req.body.videoUrl
+        : '';
+    const directImageUrl =
+      typeof req.body.imageUrl === 'string' && /^https?:\/\//i.test(req.body.imageUrl)
+        ? req.body.imageUrl
+        : '';
 
-    if (!mediaFile) {
+    if (!mediaFile && !directVideoUrl && !directImageUrl) {
       return res.status(400).json({ success: false, message: 'Media file is required' });
     }
 
@@ -992,34 +998,49 @@ exports.createAd = async (req, res) => {
 
     const isVideo =
       mediaType === 'video' ||
-      (mediaFile.mimetype && mediaFile.mimetype.startsWith('video/'));
+      (mediaFile && mediaFile.mimetype && mediaFile.mimetype.startsWith('video/')) ||
+      !!directVideoUrl;
 
-    /* ── Upload media to R2 ── */
     let videoUrl = '';
     let imageUrl = '';
     let thumbnailSmallUrl = '';
 
+    // ── MEDIA HANDLING ─────────────────────────────────────
     if (isVideo) {
-      const rawVideo = await persistFile(mediaFile, 'bluxury/ads/raw');
-      videoUrl = rawVideo?.path || '';
+      if (directVideoUrl) {
+        // ✅ Direct R2 upload — no server memory used
+        videoUrl = directVideoUrl;
+        console.log(`${TAG} 📥 using direct video URL from R2`);
+      } else if (mediaFile) {
+        // Legacy: multer upload
+        const rawVideo = await persistFile(mediaFile, 'bluxury/ads/raw');
+        videoUrl = rawVideo?.path || '';
+      }
       if (!videoUrl) {
         return res.status(500).json({ success: false, message: 'Video upload failed' });
       }
     } else {
-      const persisted = await persistFile(mediaFile, 'bluxury/ads');
-      imageUrl = persisted?.path || '';
+      if (directImageUrl) {
+        imageUrl = directImageUrl;
+      } else if (mediaFile) {
+        const persisted = await persistFile(mediaFile, 'bluxury/ads');
+        imageUrl = persisted?.path || '';
+      }
     }
 
+    // Poster (if provided as file — small, goes through server)
     if (posterFile) {
-      const p = await persistFile(posterFile, 'bluxury/ads/posters');
-      if (p?.path) imageUrl = p.path;
-    }
-    if (smallFile) {
-      const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
-      if (s?.path) thumbnailSmallUrl = s.path;
+      const persistedPoster = await persistFile(posterFile, 'bluxury/ads/posters');
+      if (persistedPoster?.path) imageUrl = persistedPoster.path;
     }
 
-    /* ── Parse fields ── */
+    // Small thumbnail (120×120)
+    if (smallFile) {
+      const persistedSmall = await persistFile(smallFile, 'bluxury/ads/thumbs');
+      if (persistedSmall?.path) thumbnailSmallUrl = persistedSmall.path;
+    }
+
+    // ── PARSE FIELDS ───────────────────────────────────────
     const postType = actor.type === 'Vendor' ? 'vendor' : 'user';
     const kind = postKind || 'post';
 
@@ -1042,7 +1063,7 @@ exports.createAd = async (req, res) => {
     try { parsedCollaborators = collaborators ? (typeof collaborators === 'string' ? JSON.parse(collaborators) : collaborators) : []; } catch {}
     try { parsedTaggedUsers = taggedUsers ? (typeof taggedUsers === 'string' ? JSON.parse(taggedUsers) : taggedUsers) : []; } catch {}
 
-    /* ── Resolve owner ── */
+    // ── RESOLVE OWNER ──────────────────────────────────────
     let vendorId = null, userId = null, vendorName = '', userName = '', userAvatar = '';
     if (actor.type === 'Vendor') {
       vendorId = actor.id;
@@ -1055,7 +1076,7 @@ exports.createAd = async (req, res) => {
       userAvatar = pickBestAvatar(u?.profilePic, u?.avatar);
     }
 
-    /* ── Build ad payload ── */
+    // ── BUILD AD ───────────────────────────────────────────
     const adPayload = {
       title: title || '',
       description: description || '',
@@ -1064,7 +1085,7 @@ exports.createAd = async (req, res) => {
       image: imageUrl,
       video: videoUrl,
       hlsUrl: '',
-      hlsStatus: 'none',                 // ✅ MP4 only
+      hlsStatus: 'none',                 // ✅ MP4-only
       thumbnail: imageUrl,
       thumbnailSmall: thumbnailSmallUrl,
       mediaType: isVideo ? 'video' : 'image',
@@ -1109,7 +1130,10 @@ exports.createAd = async (req, res) => {
     }
     if (category) {
       try {
-        await updateUserInterest(actor.id, actor.type, category, allHashtags, null, null, isVideo ? 'video' : 'image');
+        await updateUserInterest(
+          actor.id, actor.type, category, allHashtags,
+          null, null, isVideo ? 'video' : 'image'
+        );
       } catch {}
     }
 
@@ -1606,56 +1630,77 @@ exports.updateAd = async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      return res
-        .status(400)
-        .json({ success: false, message: 'Invalid post id' });
+      return res.status(400).json({ success: false, message: 'Invalid post id' });
     }
 
     const {
-      title,
-      description,
-      category,
-      link,
-      isActive,
-      isProductAd,
-      mediaType,
-      postKind,
-      tags,
-      location,
-      audio,
-      commentsDisabled,
-      hideLikeCount,
+      title, description, category, link, isActive, isProductAd,
+      mediaType, postKind, tags, location, audio,
+      commentsDisabled, hideLikeCount,
     } = req.body;
 
     const ad = await Ad.findById(id);
     if (!ad) {
-      return res
-        .status(404)
-        .json({ success: false, message: 'Post not found' });
+      return res.status(404).json({ success: false, message: 'Post not found' });
     }
     if (!ownsAd(req, ad) && !isAdminReq(req)) {
-      return res
-        .status(403)
-        .json({ success: false, message: 'Not allowed to edit this post' });
+      return res.status(403).json({ success: false, message: 'Not allowed to edit this post' });
     }
 
     const oldTags = [...(ad.tags || [])];
-    const {
-      media: mediaFile,
-      poster: posterFile,
-      small: smallFile,
-    } = extractUploadedFiles(req);
+    const { media: mediaFile, poster: posterFile, small: smallFile } =
+      extractUploadedFiles(req);
 
-    /* ═══════════════════════════════════════════════════════════
-       MEDIA CHANGES
-       ═══════════════════════════════════════════════════════════ */
-    if (mediaFile) {
-      const isVideo =
-        mediaType === 'video' ||
-        (mediaFile.mimetype && mediaFile.mimetype.startsWith('video/'));
+    // ✅ Direct R2 upload URL (from presigned flow)
+    const directVideoUrl =
+      typeof req.body.videoUrl === 'string' && /^https?:\/\//i.test(req.body.videoUrl)
+        ? req.body.videoUrl
+        : '';
+    const directImageUrl =
+      typeof req.body.imageUrl === 'string' && /^https?:\/\//i.test(req.body.imageUrl)
+        ? req.body.imageUrl
+        : '';
+
+    // ── MEDIA HANDLING ──────────────────────────────────────
+    if (directVideoUrl && !mediaFile) {
+      // ✅ New video via direct R2 upload
+      if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
+      if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
+      if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
+      if (ad.thumbnail)      await deleteFromR2(ad.thumbnail).catch(() => {});
+      if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
+
+      ad.video = directVideoUrl;
+      ad.hlsUrl = '';
+      ad.hlsStatus = 'none';
+      ad.mediaType = 'video';
+
+      if (posterFile) {
+        const p = await persistFile(posterFile, 'bluxury/ads/posters');
+        if (p?.path) { ad.image = p.path; ad.thumbnail = p.path; }
+      }
+      if (smallFile) {
+        const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
+        if (s?.path) ad.thumbnailSmall = s.path;
+      }
+    } else if (directImageUrl && !mediaFile) {
+      // ✅ New image via direct R2 upload
+      if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
+      if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
+      if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
+      if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
+
+      ad.image = directImageUrl;
+      ad.thumbnail = ad.image;
+      ad.video = '';
+      ad.hlsUrl = '';
+      ad.hlsStatus = 'none';
+      ad.mediaType = 'image';
+    } else if (mediaFile) {
+      // Legacy multer path (kept for backward compat)
+      const isVideo = mediaType === 'video' || (mediaFile.mimetype && mediaFile.mimetype.startsWith('video/'));
 
       if (isVideo) {
-        /* ✅ Case 1: New VIDEO — direct MP4 upload (no ffmpeg) */
         if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
         if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
         if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
@@ -1664,9 +1709,7 @@ exports.updateAd = async (req, res) => {
 
         const rawVideo = await persistFile(mediaFile, 'bluxury/ads/raw');
         if (!rawVideo?.path) {
-          return res
-            .status(500)
-            .json({ success: false, message: 'Video upload failed' });
+          return res.status(500).json({ success: false, message: 'Video upload failed' });
         }
         ad.video = rawVideo.path;
         ad.hlsUrl = '';
@@ -1675,13 +1718,9 @@ exports.updateAd = async (req, res) => {
 
         if (posterFile) {
           const p = await persistFile(posterFile, 'bluxury/ads/posters');
-          if (p?.path) {
-            ad.image = p.path;
-            ad.thumbnail = p.path;
-          }
+          if (p?.path) { ad.image = p.path; ad.thumbnail = p.path; }
         }
       } else {
-        /* ✅ Case 2: New IMAGE — replaces any existing video */
         if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
         if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
         if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
@@ -1696,25 +1735,20 @@ exports.updateAd = async (req, res) => {
         ad.mediaType = 'image';
       }
     } else if (posterFile && ad.mediaType === 'video') {
-      /* ✅ Case 3: Poster-only replace (video stays the same) */
+      // Poster-only change
       if (ad.image) await deleteFromR2(ad.image).catch(() => {});
       const p = await persistFile(posterFile, 'bluxury/ads/posters');
-      if (p?.path) {
-        ad.image = p.path;
-        ad.thumbnail = p.path;
-      }
+      if (p?.path) { ad.image = p.path; ad.thumbnail = p.path; }
     }
 
-    /* ✅ Small thumb (map/grid) — can update independently of media */
-    if (smallFile) {
+    // Small thumb (can update independently)
+    if (smallFile && !directVideoUrl && !directImageUrl) {
       if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
-      const persistedSmall = await persistFile(smallFile, 'bluxury/ads/thumbs');
-      if (persistedSmall?.path) ad.thumbnailSmall = persistedSmall.path;
+      const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
+      if (s?.path) ad.thumbnailSmall = s.path;
     }
 
-    /* ═══════════════════════════════════════════════════════════
-       TEXT / METADATA FIELDS
-       ═══════════════════════════════════════════════════════════ */
+    // ── TEXT FIELDS ────────────────────────────────────────
     if (title !== undefined) ad.title = title;
     if (description !== undefined) {
       ad.description = description;
@@ -1727,24 +1761,16 @@ exports.updateAd = async (req, res) => {
     if (link !== undefined) ad.link = link;
     if (isActive !== undefined) ad.isActive = isActive === 'true';
     if (isProductAd !== undefined) ad.isProductAd = isProductAd === 'true';
-    if (commentsDisabled !== undefined)
-      ad.commentsDisabled = commentsDisabled === 'true';
-    if (hideLikeCount !== undefined)
-      ad.hideLikeCount = hideLikeCount === 'true';
-
+    if (commentsDisabled !== undefined) ad.commentsDisabled = commentsDisabled === 'true';
+    if (hideLikeCount !== undefined) ad.hideLikeCount = hideLikeCount === 'true';
     if (tags !== undefined) {
       let newTags = [];
-      try {
-        newTags = Array.isArray(tags) ? tags : JSON.parse(tags);
-      } catch {
-        newTags = [];
-      }
+      try { newTags = Array.isArray(tags) ? tags : JSON.parse(tags); }
+      catch { newTags = []; }
       ad.tags = newTags.map((t) => String(t).toLowerCase());
     }
-
     if (location !== undefined) {
-      ad.location =
-        typeof location === 'string' ? JSON.parse(location) : location;
+      ad.location = typeof location === 'string' ? JSON.parse(location) : location;
     }
     if (audio !== undefined) {
       ad.audio = typeof audio === 'string' ? JSON.parse(audio) : audio;
@@ -1757,17 +1783,12 @@ exports.updateAd = async (req, res) => {
 
     await ad.save();
 
-    /* ═══════════════════════════════════════════════════════════
-       HASHTAG COUNTERS
-       ═══════════════════════════════════════════════════════════ */
+    // Hashtag diff
     const removedTags = oldTags.filter((t) => !(ad.tags || []).includes(t));
     const addedTags = (ad.tags || []).filter((t) => !oldTags.includes(t));
     if (removedTags.length > 0) await updateHashtags(removedTags, -1);
     if (addedTags.length > 0) await updateHashtags(addedTags, 1);
 
-    /* ═══════════════════════════════════════════════════════════
-       RESPONSE
-       ═══════════════════════════════════════════════════════════ */
     const populated = await Ad.findById(ad._id)
       .populate('vendorId', VENDOR_POPULATE_FIELDS)
       .populate('userId', USER_POPULATE_FIELDS)
@@ -1778,7 +1799,6 @@ exports.updateAd = async (req, res) => {
     fail(res, err, 'Failed to update post');
   }
 };
-
 exports.deleteAd = async (req, res) => {
   try {
     const { id } = req.params;
