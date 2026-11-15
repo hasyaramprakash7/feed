@@ -47,11 +47,13 @@ router.post('/presign', authMiddleware, async (req, res) => {
 
     const isVideo = contentType.startsWith('video/');
     const folder = isVideo ? 'bluxury/ads/raw' : 'bluxury/ads';
+
     const ext = (contentType.split('/')[1] || 'bin')
       .split(';')[0]
       .replace(/[^a-z0-9]/gi, '');
-
-    const key = `${folder}/${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${ext}`;
+    const key = `${folder}/${Date.now()}-${crypto
+      .randomBytes(8)
+      .toString('hex')}.${ext}`;
 
     const command = new PutObjectCommand({
       Bucket: process.env.R2_BUCKET,
@@ -59,9 +61,7 @@ router.post('/presign', authMiddleware, async (req, res) => {
       ContentType: contentType,
     });
 
-    // Presigned URL valid for 15 minutes
     const uploadUrl = await getSignedUrl(r2, command, { expiresIn: 900 });
-
     const publicUrl = `${process.env.R2_PUBLIC_BASE_URL}/${key}`;
 
     console.log(`[presign] ${isVideo ? 'VIDEO' : 'IMAGE'} → ${key}`);

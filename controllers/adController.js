@@ -972,7 +972,7 @@ exports.createAd = async (req, res) => {
     const { media: mediaFile, poster: posterFile, small: smallFile } =
       extractUploadedFiles(req);
 
-    // ✅ Support both direct R2 upload (presigned URL) AND legacy multer upload
+    // ✅ Accept both presigned direct URLs and legacy multer uploads
     const directVideoUrl =
       typeof req.body.videoUrl === 'string' && /^https?:\/\//i.test(req.body.videoUrl)
         ? req.body.videoUrl
@@ -1008,11 +1008,9 @@ exports.createAd = async (req, res) => {
     // ── MEDIA HANDLING ─────────────────────────────────────
     if (isVideo) {
       if (directVideoUrl) {
-        // ✅ Direct R2 upload — no server memory used
         videoUrl = directVideoUrl;
         console.log(`${TAG} 📥 using direct video URL from R2`);
       } else if (mediaFile) {
-        // Legacy: multer upload
         const rawVideo = await persistFile(mediaFile, 'bluxury/ads/raw');
         videoUrl = rawVideo?.path || '';
       }
@@ -1022,19 +1020,20 @@ exports.createAd = async (req, res) => {
     } else {
       if (directImageUrl) {
         imageUrl = directImageUrl;
+        console.log(`${TAG} 📥 using direct image URL from R2`);
       } else if (mediaFile) {
         const persisted = await persistFile(mediaFile, 'bluxury/ads');
         imageUrl = persisted?.path || '';
       }
     }
 
-    // Poster (if provided as file — small, goes through server)
+    // Poster (small file — goes through server, fine)
     if (posterFile) {
       const persistedPoster = await persistFile(posterFile, 'bluxury/ads/posters');
       if (persistedPoster?.path) imageUrl = persistedPoster.path;
     }
 
-    // Small thumbnail (120×120)
+    // Small thumb (120×120)
     if (smallFile) {
       const persistedSmall = await persistFile(smallFile, 'bluxury/ads/thumbs');
       if (persistedSmall?.path) thumbnailSmallUrl = persistedSmall.path;
@@ -1063,7 +1062,7 @@ exports.createAd = async (req, res) => {
     try { parsedCollaborators = collaborators ? (typeof collaborators === 'string' ? JSON.parse(collaborators) : collaborators) : []; } catch {}
     try { parsedTaggedUsers = taggedUsers ? (typeof taggedUsers === 'string' ? JSON.parse(taggedUsers) : taggedUsers) : []; } catch {}
 
-    // ── RESOLVE OWNER ──────────────────────────────────────
+    // ── OWNER RESOLUTION ───────────────────────────────────
     let vendorId = null, userId = null, vendorName = '', userName = '', userAvatar = '';
     if (actor.type === 'Vendor') {
       vendorId = actor.id;
@@ -1085,7 +1084,7 @@ exports.createAd = async (req, res) => {
       image: imageUrl,
       video: videoUrl,
       hlsUrl: '',
-      hlsStatus: 'none',                 // ✅ MP4-only
+      hlsStatus: 'none',
       thumbnail: imageUrl,
       thumbnailSmall: thumbnailSmallUrl,
       mediaType: isVideo ? 'video' : 'image',
@@ -1130,10 +1129,7 @@ exports.createAd = async (req, res) => {
     }
     if (category) {
       try {
-        await updateUserInterest(
-          actor.id, actor.type, category, allHashtags,
-          null, null, isVideo ? 'video' : 'image'
-        );
+        await updateUserInterest(actor.id, actor.type, category, allHashtags, null, null, isVideo ? 'video' : 'image');
       } catch {}
     }
 
@@ -1161,7 +1157,6 @@ exports.createAd = async (req, res) => {
     fail(res, err, 'Failed to create post');
   }
 };
-
 
 // ═════════════════════════════════════════════════════════
 // CREATE STORY
@@ -1651,7 +1646,6 @@ exports.updateAd = async (req, res) => {
     const { media: mediaFile, poster: posterFile, small: smallFile } =
       extractUploadedFiles(req);
 
-    // ✅ Direct R2 upload URL (from presigned flow)
     const directVideoUrl =
       typeof req.body.videoUrl === 'string' && /^https?:\/\//i.test(req.body.videoUrl)
         ? req.body.videoUrl
@@ -1663,7 +1657,6 @@ exports.updateAd = async (req, res) => {
 
     // ── MEDIA HANDLING ──────────────────────────────────────
     if (directVideoUrl && !mediaFile) {
-      // ✅ New video via direct R2 upload
       if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
       if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
       if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
@@ -1684,7 +1677,6 @@ exports.updateAd = async (req, res) => {
         if (s?.path) ad.thumbnailSmall = s.path;
       }
     } else if (directImageUrl && !mediaFile) {
-      // ✅ New image via direct R2 upload
       if (ad.image)          await deleteFromR2(ad.image).catch(() => {});
       if (ad.video)          await deleteFromR2(ad.video).catch(() => {});
       if (ad.hlsUrl)         await deleteFromR2(ad.hlsUrl).catch(() => {});
@@ -1697,7 +1689,7 @@ exports.updateAd = async (req, res) => {
       ad.hlsStatus = 'none';
       ad.mediaType = 'image';
     } else if (mediaFile) {
-      // Legacy multer path (kept for backward compat)
+      // Legacy multer path
       const isVideo = mediaType === 'video' || (mediaFile.mimetype && mediaFile.mimetype.startsWith('video/'));
 
       if (isVideo) {
@@ -1735,13 +1727,11 @@ exports.updateAd = async (req, res) => {
         ad.mediaType = 'image';
       }
     } else if (posterFile && ad.mediaType === 'video') {
-      // Poster-only change
       if (ad.image) await deleteFromR2(ad.image).catch(() => {});
       const p = await persistFile(posterFile, 'bluxury/ads/posters');
       if (p?.path) { ad.image = p.path; ad.thumbnail = p.path; }
     }
 
-    // Small thumb (can update independently)
     if (smallFile && !directVideoUrl && !directImageUrl) {
       if (ad.thumbnailSmall) await deleteFromR2(ad.thumbnailSmall).catch(() => {});
       const s = await persistFile(smallFile, 'bluxury/ads/thumbs');
@@ -1783,7 +1773,6 @@ exports.updateAd = async (req, res) => {
 
     await ad.save();
 
-    // Hashtag diff
     const removedTags = oldTags.filter((t) => !(ad.tags || []).includes(t));
     const addedTags = (ad.tags || []).filter((t) => !oldTags.includes(t));
     if (removedTags.length > 0) await updateHashtags(removedTags, -1);
